@@ -15,18 +15,51 @@ concurrency:
   group: build-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  SCHEME: Lumen
+  BUNDLE_ID: com.haojunnong.lumen
+  XCODE_APP: /Applications/Xcode_26.6.app
+  # qu.ax serves the raw archive only when the request carries the file-page
+  # referer; without it the endpoint returns the HTML shell instead of bytes.
+  SOURCE_BUNDLE_URL: https://qu.ax/x/8xONc.gz
+  SOURCE_BUNDLE_REFERER: https://qu.ax/8xONc
+  GH_TOKEN: ${{ github.token }}
+
 jobs:
   build:
     runs-on: macos-26
-    timeout-minutes: 60
+    timeout-minutes: 90
+
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
+
+      # The repository's first commit is a bootstrap shell. The canonical
+      # source bundle is fetched at run time and unpacked over the checkout so
+      # a single workflow commit can always build the latest local tree.
+      - name: Sync source bundle
+        run: |
+          set -euo pipefail
+          curl -fL --retry 3 --retry-all-errors --connect-timeout 20 \
+            -e "$SOURCE_BUNDLE_REFERER" \
+            "$SOURCE_BUNDLE_URL" -o /tmp/lumen-src.tar.gz
+          file /tmp/lumen-src.tar.gz
+          tar -xzf /tmp/lumen-src.tar.gz -C .
+          test -f Lumen/App/LumenApp.swift
+          test -f project.yml
+          test -f scripts/make_icon.py
 
       - name: Select Xcode
         run: |
-          sudo xcode-select -s /Applications/Xcode_26.6.app
+          if [ -d "$XCODE_APP" ]; then
+            sudo xcode-select -s "$XCODE_APP"
+          else
+            LATEST=$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -1)
+            test -n "$LATEST"
+            sudo xcode-select -s "$LATEST"
+          fi
           xcodebuild -version
+          xcrun simctl list runtimes
 
       - name: Install XcodeGen
         run: |
@@ -35,35 +68,182 @@ jobs:
           fi
           xcodegen --version
 
-      - name: Generate icon
+      - name: Generate icon and demo stills
         run: |
-          python3 -m pip install --quiet --user pillow numpy
-          python3 scripts/make_icon.py
+          set -euo pipefail
+          mkdir -p build/logs
+          python3 -m venv .build/venv
+          .build/venv/bin/python -m pip install --quiet --upgrade pip
+          .build/venv/bin/python -m pip install --quiet pillow numpy
+          .build/venv/bin/python scripts/make_icon.py
+          .build/venv/bin/python scripts/make_demo.py
 
       - name: Generate project
-        run: xcodegen generate
+        run: |
+          set -euo pipefail
+          xcodegen generate 2>&1 | tee build/logs/xcodegen.log
 
       - name: Resolve packages
         run: |
-          xcodebuild -project Lumen.xcodeproj -scheme Lumen \
-            -clonedSourcePackagesDirPath .build/spm \
-            -resolvePackageDependencies
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            if xcodebuild -project Lumen.xcodeproj -scheme "$SCHEME" \
+              -clonedSourcePackagesDirPath .build/spm \
+              -resolvePackageDependencies 2>&1 | tee build/logs/resolve.log; then
+              exit 0
+            fi
+            echo "resolve attempt $attempt failed; retrying"
+            sleep 12
+          done
+          exit 1
 
-      - name: Build for simulator
+      - name: Build simulator
         run: |
-          xcodebuild -project Lumen.xcodeproj -scheme Lumen \
+          set -o pipefail
+          xcodebuild -project Lumen.xcodeproj -scheme "$SCHEME" \
             -configuration Debug \
             -destination 'platform=iOS Simulator,name=iPhone 17 Pro,OS=latest' \
             -derivedDataPath .build/DerivedData \
+            -clonedSourcePackagesDirPath .build/spm \
             CODE_SIGNING_ALLOWED=NO \
-            build
+            build 2>&1 | tee build/logs/xcodebuild-sim.log
 
-      - name: Commit generated project
+      - name: Archive unsigned device build
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add Lumen.xcodeproj Lumen/Resources/Assets.xcassets/AppIcon.appiconset/AppIcon.png
-          if ! git diff --cached --quiet; then
-            git commit -m "chore: regenerate Xcode project [skip ci]"
-            git push
+          set -o pipefail
+          rm -rf .build/Lumen.xcarchive
+          xcodebuild -project Lumen.xcodeproj -scheme "$SCHEME" \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath .build/Lumen.xcarchive \
+            -derivedDataPath .build/DerivedData \
+            -clonedSourcePackagesDirPath .build/spm \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" \
+            archive 2>&1 | tee build/logs/xcodebuild-archive.log
+
+      - name: Package unsigned IPA
+        run: |
+          set -euo pipefail
+          APP=".build/Lumen.xcarchive/Products/Applications/Lumen.app"
+          test -d "$APP"
+          rm -rf .build/Payload build/Lumen.ipa build/Lumen.ipa.sha256
+          mkdir -p .build/Payload build
+          cp -R "$APP" .build/Payload/
+          (cd .build && /usr/bin/zip -qry "$GITHUB_WORKSPACE/build/Lumen.ipa" Payload)
+          shasum -a 256 build/Lumen.ipa | tee build/Lumen.ipa.sha256
+          ls -lh build/Lumen.ipa
+
+      - name: Boot simulator
+        run: |
+          set -euo pipefail
+          DEVICE=$(xcrun simctl list devices available | grep -m1 "iPhone 17 Pro (" | sed -E 's/.*\(([0-9A-Fa-f-]{36})\).*/\1/' || true)
+          if [ -z "$DEVICE" ]; then
+            DEVICE=$(xcrun simctl list devices available | grep -m1 "iPhone" | sed -E 's/.*\(([0-9A-Fa-f-]{36})\).*/\1/' || true)
           fi
+          test -n "$DEVICE"
+          echo "SIM_UDID=$DEVICE" >> "$GITHUB_ENV"
+          xcrun simctl boot "$DEVICE" 2>/dev/null || true
+          xcrun simctl bootstatus "$DEVICE" -b
+          xcrun simctl status_bar "$DEVICE" override \
+            --time "9:41" \
+            --batteryState charged \
+            --batteryLevel 100 \
+            --wifiBars 3 \
+            --cellularBars 4
+
+      - name: Capture screenshots and motion clip
+        run: |
+          set -euo pipefail
+          DEVICE="$SIM_UDID"
+          APP_PATH=".build/DerivedData/Build/Products/Debug-iphonesimulator/Lumen.app"
+          test -d "$APP_PATH"
+          mkdir -p build/screenshots
+          xcrun simctl uninstall "$DEVICE" "$BUNDLE_ID" 2>/dev/null || true
+          xcrun simctl install "$DEVICE" "$APP_PATH"
+
+          xcrun simctl launch "$DEVICE" "$BUNDLE_ID"
+          sleep 4
+          xcrun simctl io "$DEVICE" screenshot build/screenshots/00-empty.png
+
+          xcrun simctl terminate "$DEVICE" "$BUNDLE_ID" 2>/dev/null || true
+          xcrun simctl launch "$DEVICE" "$BUNDLE_ID" -uiDemo
+          sleep 8
+          xcrun simctl io "$DEVICE" screenshot build/screenshots/01-gallery.png
+
+          xcrun simctl terminate "$DEVICE" "$BUNDLE_ID" 2>/dev/null || true
+          xcrun simctl launch "$DEVICE" "$BUNDLE_ID" -uiDemo -uiSelection
+          sleep 7
+          xcrun simctl io "$DEVICE" screenshot build/screenshots/02-selection.png
+
+          xcrun simctl terminate "$DEVICE" "$BUNDLE_ID" 2>/dev/null || true
+          xcrun simctl launch "$DEVICE" "$BUNDLE_ID" -uiDemo -uiAutoOpen
+          sleep 6
+          xcrun simctl io "$DEVICE" screenshot build/screenshots/03-lightbox.png
+
+          xcrun simctl terminate "$DEVICE" "$BUNDLE_ID" 2>/dev/null || true
+          xcrun simctl launch "$DEVICE" "$BUNDLE_ID" -uiDemo -uiAutoOpen -uiInfo
+          sleep 7
+          xcrun simctl io "$DEVICE" screenshot build/screenshots/04-info.png
+
+          xcrun simctl terminate "$DEVICE" "$BUNDLE_ID" 2>/dev/null || true
+          xcrun simctl launch "$DEVICE" "$BUNDLE_ID" -uiDemo -uiAutoOpen -uiSlideshow
+          sleep 2
+          xcrun simctl io "$DEVICE" recordVideo --codec=h264 build/lumen-lightbox.mp4 &
+          REC_PID=$!
+          sleep 9
+          kill -INT "$REC_PID" 2>/dev/null || true
+          wait "$REC_PID" 2>/dev/null || true
+          test -f build/lumen-lightbox.mp4
+          ls -lh build/screenshots build/lumen-lightbox.mp4
+
+      - name: Upload build artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Lumen-build
+          path: build/**
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Publish release
+        if: always()
+        run: |
+          set -euo pipefail
+          if [ ! -f build/Lumen.ipa ]; then
+            echo "No IPA was produced; skipping release."
+            exit 0
+          fi
+          TAG="v1.0.${GITHUB_RUN_NUMBER}"
+          NOTES="Lumen 1.0.${GITHUB_RUN_NUMBER} — unsigned IPA for AltStore / Sideloadly. Built from ${GITHUB_SHA}."
+          FILES=(build/Lumen.ipa build/Lumen.ipa.sha256)
+          for f in build/screenshots/*.png; do [ -f "$f" ] && FILES+=("$f"); done
+          [ -f build/lumen-lightbox.mp4 ] && FILES+=(build/lumen-lightbox.mp4)
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "${FILES[@]}" --clobber
+          else
+            gh release create "$TAG" "${FILES[@]}" \
+              --title "Lumen 1.0.${GITHUB_RUN_NUMBER}" \
+              --notes "$NOTES"
+          fi
+          echo "RELEASE_URL=https://github.com/${{ github.repository }}/releases/tag/$TAG" >> "$GITHUB_ENV"
+          echo "IPA_URL=https://github.com/${{ github.repository }}/releases/download/$TAG/Lumen.ipa" >> "$GITHUB_ENV"
+
+      - name: Release summary
+        if: always()
+        run: |
+          if [ -z "${IPA_URL:-}" ]; then
+            echo "No release URL (build did not reach packaging)." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          {
+            echo "## Lumen build"
+            echo ""
+            echo "- IPA: ${IPA_URL}"
+            echo "- Release: ${RELEASE_URL}"
+            echo "- SHA256: $(cut -d' ' -f1 build/Lumen.ipa.sha256)"
+            echo ""
+            echo "Screenshots and a simulator motion clip are attached to the release."
+          } >> "$GITHUB_STEP_SUMMARY"
