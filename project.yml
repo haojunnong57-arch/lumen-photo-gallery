@@ -1,0 +1,67 @@
+name: Lumen
+options:
+  bundleIdPrefix: com.haojunnong
+  deploymentTarget:
+    iOS: "18.0"
+  createIntermediateGroups: true
+  generateEmptyDirectories: true
+  groupSortPosition: top
+
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    SWIFT_STRICT_CONCURRENCY: complete
+    ENABLE_USER_SCRIPT_SANDBOXING: YES
+    DEAD_CODE_STRIPPING: YES
+    CODE_SIGN_STYLE: Automatic
+    DEVELOPMENT_TEAM: ""
+
+packages:
+  LiquidPhotos:
+    url: https://github.com/haplollc/LiquidPhotos
+    exactVersion: 1.0.0
+  Kinetics:
+    url: https://github.com/roberthein/Kinetics
+    exactVersion: 1.0.0
+  WaterfallGrids:
+    url: https://github.com/ricocrescenzio95/WaterfallGrids
+    exactVersion: 1.0.1
+  LiquidGlass:
+    url: https://github.com/rguillen-dev/LiquidGlass
+    exactVersion: 1.3.0
+
+targets:
+  Lumen:
+    type: application
+    platform: iOS
+    sources:
+      - path: Lumen
+        excludes:
+          - "Resources/**"
+    resources:
+      - path: Lumen/Resources
+    dependencies:
+      - package: LiquidPhotos
+        product: LiquidPhotos
+      - package: Kinetics
+        product: Kinetics
+      - package: WaterfallGrids
+        product: WaterfallGrids
+      - package: LiquidGlass
+        product: LiquidGlass
+    settings:
+      base:
+        PRODUCT_NAME: Lumen
+        PRODUCT_BUNDLE_IDENTIFIER: com.haojunnong.lumen
+        INFOPLIST_FILE: Lumen/Info.plist
+        GENERATE_INFOPLIST_FILE: NO
+        TARGETED_DEVICE_FAMILY: "1"
+        SUPPORTS_MACCATALYST: NO
+        SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD: NO
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+        MARKETING_VERSION: "1.0.0"
+        CURRENT_PROJECT_VERSION: "1"
+        ENABLE_PREVIEWS: YES
+        SWIFT_EMIT_LOC_STRINGS: YES
+        LOCALIZATION_PREFERS_STRING_CATALOGS: NO
